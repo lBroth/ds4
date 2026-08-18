@@ -3319,6 +3319,19 @@ static void dsv4_fp4_act_quantize_row_inplace_cpu(float *x, uint32_t n) {
  * Hadamard transform and immediately runs the FP4 activation-simulation
  * round trip. This applies to both indexer Q and the indexer compressor KV;
  * without it, the top-k compressed-row selection is not the model's graph. */
+/* Diagnostic: DS4_QAT_SELFTEST=1 runs the indexer QAT on a fixed vector and prints it, so an
+ * external engine can verify its own Hadamard+FP4 without a full model run. */
+static void dsv4_indexer_qat_row_inplace_cpu(float *x, uint32_t head_dim); /* fwd decl: defined below */
+void ds4_qat_selftest(void) {
+    float x[128];
+    unsigned long seed = 0x2545F4914F6CDD1DUL;
+    for (int i = 0; i < 128; i++) {
+        seed = seed * 6364136223846793005UL + 1442695040888963407UL;
+        x[i] = ((float)((seed >> 33) & 0xFFFF) / 32768.0f - 1.0f) * 3.0f;
+    }
+    dsv4_indexer_qat_row_inplace_cpu(x, 128);
+    for (int i = 0; i < 128; i++) printf("%.9g\n", x[i]);
+}
 static void dsv4_indexer_qat_row_inplace_cpu(float *x, uint32_t head_dim) {
     if (head_dim != 128) ds4_die("DSV4 indexer QAT expects 128-wide indexer rows");
     dsv4_hadamard128_inplace_cpu(x);
@@ -10689,6 +10702,10 @@ static void layer_shared_ffn_batch(
     free(gate);
 }
 
+static void ds4_ref_dump(const char *tag, int il, const float *p, int n); /* fwd decl: diagnostic dumps */
+static int  ds4_dump_layer(void);                                          /* fwd decl: DS4_DUMP_LAYER */
+static void ds4_ref_dump_pos(const char *tag, int il, int pos, const float *p, int n);
+static void ds4_ref_dump_bool(const char *tag, int il, int pos, const bool *b, int n);
 /* Early DS4 layers use token-id hash routing instead of top-k routing. */
 static void layer_hash_selected_experts(
         int                    selected[DS4_MAX_EXPERT_USED],
@@ -10875,6 +10892,21 @@ static void layer_routed_moe_one(
         layer_topk_selected_experts(selected, expert_weight, model, layer, x);
     }
 
+    /* Diagnostic (DS4_DUMP=1 only): see the twin block in layer_routed_moe_one_prealloc. */
+    {
+        static int dump_sel = -1;
+        if (dump_sel < 0) { const char *e = getenv("DS4_DUMP"); dump_sel = (e && *e == '1'); }
+        if (dump_sel) {
+            float self[DS4_MAX_EXPERT_USED];
+            for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) self[i] = (float)selected[i];
+            ds4_ref_dump("sel", (int)il, self, (int)DS4_N_EXPERT_USED);
+            ds4_ref_dump("selw", (int)il, expert_weight, (int)DS4_N_EXPERT_USED);
+            float probs_dbg[DS4_MAX_EXPERT];
+            layer_router_probs_one(probs_dbg, model, layer, x);
+            ds4_ref_dump("probs", (int)il, probs_dbg, (int)DS4_N_EXPERT);
+        }
+    }
+
     if (routed_q8_0) {
         const uint64_t x_blocks = expert_in_dim / 32u;
         int8_t *xq8 = xmalloc((size_t)x_blocks * 32u);
@@ -11028,6 +11060,22 @@ static void layer_routed_moe_one_prealloc(
         layer_hash_router_weights_one(expert_weight, model, layer, x, selected);
     } else {
         layer_topk_selected_experts(selected, expert_weight, model, layer, x);
+    }
+
+    /* Diagnostic (DS4_DUMP=1 only): expert selection, weights and router probs per layer.
+     * Lets an external engine check WHICH experts ran, not just the hidden state. */
+    {
+        static int dump_sel = -1;
+        if (dump_sel < 0) { const char *e = getenv("DS4_DUMP"); dump_sel = (e && *e == '1'); }
+        if (dump_sel) {
+            float self[DS4_MAX_EXPERT_USED];
+            for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) self[i] = (float)selected[i];
+            ds4_ref_dump("sel", (int)il, self, (int)DS4_N_EXPERT_USED);
+            ds4_ref_dump("selw", (int)il, expert_weight, (int)DS4_N_EXPERT_USED);
+            float probs_dbg[DS4_MAX_EXPERT];
+            layer_router_probs_one(probs_dbg, model, layer, x);
+            ds4_ref_dump("probs", (int)il, probs_dbg, (int)DS4_N_EXPERT);
+        }
     }
 
     if (routed_q8_0) {
@@ -13011,7 +13059,31 @@ static bool *indexer_allowed_decode_one_decode_scratch(
 
     bool *allowed = scratch->index_allowed;
     memset(allowed, 0, (size_t)n_comp * sizeof(allowed[0]));
-    const uint32_t top_k = DS4_N_INDEXER_TOP_K < n_comp ? DS4_N_INDEXER_TOP_K : n_comp;
+    uint32_t topk_cap = DS4_N_INDEXER_TOP_K;                 /* DS4_INDEXER_TOP_K forces a small cap to exercise
+                                                             * real selection/masking at low pos (verification). */
+    { const char *e = getenv("DS4_INDEXER_TOP_K"); if (e && *e) { int v = atoi(e); if (v > 0) topk_cap = (uint32_t)v; } }
+    const uint32_t top_k = topk_cap < n_comp ? topk_cap : n_comp;
+    /* Diagnostic (DS4_DUMP=1, dump layer only): compute + dump the indexer query, gate weights and
+     * scores even on the top_k==n_comp early-return path, so the flux scorer can be bit-verified on
+     * short traces (n_comp never reaches 512 there). Does NOT affect selection. */
+    if ((int)il == ds4_dump_layer()) { const char *de = getenv("DS4_DUMP");
+        if (de && *de == '1') {
+            const uint32_t hd = DS4_N_INDEXER_HEAD_DIM, nh = DS4_N_INDEXER_HEAD;
+            float *dq = scratch->index_q, *dw = scratch->index_weights, *dsc = scratch->index_scores;
+            matvec_any_decode_scratch(dq, model, layer->indexer_attn_q_b, qr_norm, scratch);
+            rope_tail_layer_inplace(dq, nh, hd, DS4_N_ROT, pos, il, false);
+            dsv4_indexer_qat_rows_inplace_cpu(dq, nh, hd);
+            matvec_any_decode_scratch(dw, model, layer->indexer_proj, cur, scratch);
+            const float dscl = 1.0f / sqrtf((float)(hd * nh));
+            for (uint32_t h = 0; h < nh; h++) dw[h] *= dscl;
+            for (uint32_t c = 0; c < n_comp; c++) { const float *kv = index_comp + (uint64_t)c * hd; float s = 0.0f;
+                for (uint32_t h = 0; h < nh; h++) { float d = dot_f32(kv, dq + (uint64_t)h * hd, hd); if (d < 0.0f) d = 0.0f; s += d * dw[h]; }
+                dsc[c] = s; }
+            ds4_ref_dump_pos("iq",  (int)il, (int)pos, dq,  (int)(nh * hd));
+            ds4_ref_dump_pos("iw",  (int)il, (int)pos, dw,  (int)nh);
+            ds4_ref_dump_pos("isc", (int)il, (int)pos, dsc, (int)n_comp);
+        }
+    }
     if (top_k == n_comp) {
         for (uint32_t i = 0; i < n_comp; i++) allowed[i] = true;
         return allowed;
@@ -13570,6 +13642,11 @@ static void layer_forward_raw_swa_one(
                                                     scratch->qr_norm,
                                                     scratch);
     if (profile) t_q = now_sec() - t0;
+    if ((int)il == ds4_dump_layer()) {
+        /* [1] compressor + indexer input, [2] indexer Q input */
+        ds4_ref_dump_pos("attn_norm", (int)il, (int)pos, scratch->attn_norm, (int)DS4_N_EMBD);
+        ds4_ref_dump_pos("qr_norm",   (int)il, (int)pos, scratch->qr_norm,   (int)DS4_N_LORA_Q);
+    }
     t0 = profile ? now_sec() : 0.0;
     layer_kv_projection_normed_one_decode_scratch(model, layer,
                                                   scratch->attn_norm,
@@ -13584,6 +13661,14 @@ static void layer_forward_raw_swa_one(
 
     kv_cache_push_raw(cache, scratch->kv);
     if (profile) t_rope_cache = now_sec() - t0;
+    if ((int)il == ds4_dump_layer()) {
+        /* [3] first place pos>0 changes anything, [4] pre-cache row, [5] whole raw window */
+        ds4_ref_dump_pos("q_rope", (int)il, (int)pos, scratch->q,
+                         (int)(DS4_N_HEAD * DS4_N_HEAD_DIM));
+        ds4_ref_dump_pos("kv_fp8", (int)il, (int)pos, scratch->kv, (int)DS4_N_HEAD_DIM);
+        ds4_ref_dump_pos("rawkv",  (int)il, (int)pos, cache->raw_kv,
+                         (int)((uint64_t)cache->n_raw * DS4_N_HEAD_DIM));
+    }
 
     if (ratio != 0) {
         t0 = profile ? now_sec() : 0.0;
@@ -13601,6 +13686,16 @@ static void layer_forward_raw_swa_one(
                                                  pos,
                                                  scratch)) {
             kv_cache_push_comp(cache->attn_comp_kv, &cache->n_comp, cache->comp_cap, DS4_N_HEAD_DIM, scratch->comp);
+        }
+        if ((int)il == ds4_dump_layer()) {
+            /* [6] the compressor recurrent state, [7] emitted compressed rows.
+             * State geometry mirrors kv_cache_init: coff = 2 lanes at ratio 4, else 1. */
+            const uint32_t coff = (ratio == 4) ? 2u : 1u;
+            const int st_n = (int)((uint64_t)(coff * DS4_N_HEAD_DIM) * (coff * ratio));
+            ds4_ref_dump_pos("cstate_kv", (int)il, (int)pos, cache->attn_state_kv,    st_n);
+            ds4_ref_dump_pos("cstate_sc", (int)il, (int)pos, cache->attn_state_score, st_n);
+            ds4_ref_dump_pos("compkv",    (int)il, (int)pos, cache->attn_comp_kv,
+                             (int)((uint64_t)cache->n_comp * DS4_N_HEAD_DIM));
         }
 
         if (ratio == 4) {
@@ -13621,6 +13716,14 @@ static void layer_forward_raw_swa_one(
                                    DS4_N_INDEXER_HEAD_DIM, scratch->index_comp);
             }
             if (profile) t_compress = now_sec() - t0;
+            if ((int)il == ds4_dump_layer()) {
+                /* [8] indexer lane: recurrent state + emitted rows */
+                const int ist_n = (int)((uint64_t)(2u * DS4_N_INDEXER_HEAD_DIM) * (2u * ratio));
+                ds4_ref_dump_pos("istate_kv", (int)il, (int)pos, cache->index_state_kv,    ist_n);
+                ds4_ref_dump_pos("istate_sc", (int)il, (int)pos, cache->index_state_score, ist_n);
+                ds4_ref_dump_pos("icompkv",   (int)il, (int)pos, cache->index_comp_kv,
+                                 (int)((uint64_t)cache->n_index_comp * DS4_N_INDEXER_HEAD_DIM));
+            }
         } else if (profile) {
             t_compress = now_sec() - t0;
         }
@@ -13635,6 +13738,10 @@ static void layer_forward_raw_swa_one(
                                                                  il, pos,
                                                                  scratch);
         if (profile) t_indexer = now_sec() - t0;
+        if ((int)il == ds4_dump_layer()) {
+            /* [9] top-k mask; NULL (no file) while n_comp == 0, all-ones until n_comp > top_k */
+            ds4_ref_dump_bool("allow", (int)il, (int)pos, comp_allowed, (int)cache->n_index_comp);
+        }
     }
 
     t0 = profile ? now_sec() : 0.0;
@@ -13648,17 +13755,32 @@ static void layer_forward_raw_swa_one(
         layer_attention_rows_one(scratch->heads, model, layer, scratch->q, cache->raw_kv, cache->n_raw);
     }
     if (profile) t_attn_rows = now_sec() - t0;
+    /* [10] mixed-attention output, pre inverse-RoPE */
+    if ((int)il == ds4_dump_layer())
+        ds4_ref_dump_pos("heads", (int)il, (int)pos, scratch->heads,
+                         (int)(DS4_N_HEAD * DS4_N_HEAD_DIM));
 
     t0 = profile ? now_sec() : 0.0;
     rope_tail_layer_inplace(scratch->heads, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_ROT, pos, il, true);
     if (profile) t_inv_rope = now_sec() - t0;
+    /* [11] after inverse RoPE */
+    if ((int)il == ds4_dump_layer())
+        ds4_ref_dump_pos("heads_inv", (int)il, (int)pos, scratch->heads,
+                         (int)(DS4_N_HEAD * DS4_N_HEAD_DIM));
     t0 = profile ? now_sec() : 0.0;
     layer_grouped_out_one_decode_scratch(scratch->attn_out, model, layer, scratch->heads, scratch);
     cpu_directional_steering_project_rows(scratch->attn_out, steering_dirs, il, 1, steering_attn_scale);
     if (profile) t_out = now_sec() - t0;
+    /* [12] grouped-out (after the no-op steering projection) */
+    if ((int)il == ds4_dump_layer())
+        ds4_ref_dump_pos("attn_out", (int)il, (int)pos, scratch->attn_out, (int)DS4_N_EMBD);
     t0 = profile ? now_sec() : 0.0;
     hc_post_one(scratch->after_attn_hc, scratch->attn_out, scratch->attn_residual, post, comb, DS4_N_EMBD, n_hc);
     if (profile) t_post = now_sec() - t0;
+    /* [13] after hc_post_one */
+    if ((int)il == ds4_dump_layer())
+        ds4_ref_dump_pos("after_attn", (int)il, (int)pos, scratch->after_attn_hc,
+                         (int)((uint64_t)n_hc * DS4_N_EMBD));
 
     t0 = profile ? now_sec() : 0.0;
     layer_ffn_one_decode_scratch(out_hc, model, layer, scratch->after_attn_hc, il, token,
@@ -13694,6 +13816,72 @@ static void output_logits_one_decode_scratch(
 
 /* CPU decode for one token through all 43 layers.  The caller owns scratch and
  * cache lifetimes so no per-token allocations are needed. */
+/* Reference-dump hook for flux-V4 verification. Gated by env DS4_DUMP=1; writes binary f32.
+ * DS4_DUMP_DIR overrides the output directory so cross-test runs over several token
+ * ids can dump side by side instead of overwriting each other. */
+static void ds4_ref_dump(const char *tag, int il, const float *p, int n) {
+    static int on = -1;
+    static const char *dir = NULL;
+    if (on < 0) {
+        const char *e = getenv("DS4_DUMP"); on = (e && *e == '1');
+        dir = getenv("DS4_DUMP_DIR");
+        if (!dir || !dir[0]) dir = "/Users/broth/Documents/research/flux/engine/dsv4-ref";
+        else if (on) mkdir(dir, 0755); /* best effort; one level only */
+    }
+    if (!on) return;
+    char path[512];
+    if (il >= 0) snprintf(path, sizeof path, "%s/%s_%d.bin", dir, tag, il);
+    else         snprintf(path, sizeof path, "%s/%s.bin", dir, tag);
+    FILE *f = fopen(path, "wb"); if (f) { fwrite(p, sizeof(float), (size_t)n, f); fclose(f); }
+}
+
+/* Per-POSITION reference dumps for flux-V4 decode verification.  Same gating and
+ * DS4_DUMP_DIR handling as ds4_ref_dump above, but the filename carries the
+ * position (and layer) so a multi-token decode does not overwrite itself:
+ *   <dir>/<tag>_pNNN_lLL.bin   (il >= 0)
+ *   <dir>/<tag>_pNNN.bin       (il <  0)
+ * The row count is recoverable from the file size, so n == 0 still creates an
+ * empty file (that is a real observation: "no compressed rows yet").
+ * DS4_DUMP_LAYER (default 2) limits the fine-grained per-layer hooks to one layer. */
+static int ds4_ref_dump_enabled(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("DS4_DUMP"); on = (e && *e == '1'); }
+    return on;
+}
+
+static int ds4_dump_layer(void) {
+    static int l = -2;
+    if (l == -2) { const char *e = getenv("DS4_DUMP_LAYER"); l = (e && *e) ? atoi(e) : 2; }
+    return l;
+}
+
+static void ds4_ref_dump_pos(const char *tag, int il, int pos, const float *p, int n) {
+    static const char *dir = NULL;
+    if (!ds4_ref_dump_enabled()) return;
+    if (!dir) {
+        dir = getenv("DS4_DUMP_DIR");
+        if (!dir || !dir[0]) dir = "/Users/broth/Documents/research/flux/engine/dsv4-ref";
+        else mkdir(dir, 0755); /* best effort; one level only */
+    }
+    if (n < 0 || (n > 0 && !p)) return;
+    char path[512];
+    if (il >= 0) snprintf(path, sizeof path, "%s/%s_p%03d_l%02d.bin", dir, tag, pos, il);
+    else         snprintf(path, sizeof path, "%s/%s_p%03d.bin", dir, tag, pos);
+    FILE *f = fopen(path, "wb");
+    if (f) {
+        if (n > 0) fwrite(p, sizeof(float), (size_t)n, f);
+        fclose(f);
+    }
+}
+
+static void ds4_ref_dump_bool(const char *tag, int il, int pos, const bool *b, int n) {
+    if (!ds4_ref_dump_enabled() || !b || n <= 0) return;
+    float *tmp = xmalloc((size_t)n * sizeof(float));
+    for (int i = 0; i < n; i++) tmp[i] = b[i] ? 1.0f : 0.0f;
+    ds4_ref_dump_pos(tag, il, pos, tmp, n);
+    free(tmp);
+}
+
 static void forward_token_raw_swa_cpu_decode_scratch(
         float             * logits,
         const ds4_model   * model,
@@ -13710,6 +13898,7 @@ static void forward_token_raw_swa_cpu_decode_scratch(
 
     embed_token_f16(model, weights, token, scratch->plain);
     hc_from_plain_embedding(cur, scratch->plain, DS4_N_EMBD, DS4_N_HC);
+    ds4_ref_dump_pos("embed", -1, (int)pos, cur, (int)(DS4_N_EMBD * DS4_N_HC));
 
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         layer_forward_raw_swa_one(next, model, &weights->layer[il], &cache->layer[il],
@@ -13718,6 +13907,7 @@ static void forward_token_raw_swa_cpu_decode_scratch(
                                   steering_attn_scale,
                                   steering_ffn_scale,
                                   scratch);
+        ds4_ref_dump_pos("layer", (int)il, (int)pos, next, (int)(DS4_N_EMBD * DS4_N_HC));
         float *tmp = cur;
         cur = next;
         next = tmp;
@@ -13725,6 +13915,7 @@ static void forward_token_raw_swa_cpu_decode_scratch(
 
     if (logits) {
         output_logits_one_decode_scratch(logits, model, weights, cur, scratch);
+        ds4_ref_dump_pos("logits", -1, (int)pos, logits, (int)DS4_N_VOCAB);
     }
 }
 
@@ -13906,6 +14097,8 @@ static void prefill_layer_major_cpu(
 
     if (logits) {
         output_logits_one(logits, model, weights, cur + (n_tok - 1) * hc_dim);
+        /* Give the last prefill position a logits file comparable with the decode dumps. */
+        ds4_ref_dump_pos("logits", -1, (int)n_tok - 1, logits, (int)DS4_N_VOCAB);
     }
 
     if (decode_scratch_ready) cpu_decode_scratch_free(&decode_scratch);
@@ -13944,19 +14137,25 @@ static void layer_forward_self_one(
                           layer->hc_attn_scale,
                           layer->hc_attn_base,
                           attn_residual, attn_cur, post, comb);
+    if (il==0){ ds4_ref_dump("attn_cur",0,attn_cur,(int)DS4_N_EMBD);
+                ds4_ref_dump("hc_apost",0,post,4); ds4_ref_dump("hc_comb",0,comb,16); }
 
     layer_attn_norm_one(attn_norm, model, layer, attn_cur);
+    if (il==0) ds4_ref_dump("attn_norm",0,attn_norm,(int)DS4_N_EMBD);
     layer_q_projection_normed_one(model, layer, attn_norm, q);
     layer_kv_projection_normed_one(model, layer, attn_norm, kv);
     rope_tail_layer_inplace(q, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_ROT, pos, il, false);
     rope_tail_layer_inplace(kv, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, DS4_N_ROT, pos, il, false);
     dsv4_fp8_kv_quantize_row_inplace_cpu(kv, DS4_N_HEAD_DIM, DS4_N_ROT);
     f16_round_inplace_cpu(kv, DS4_N_HEAD_DIM);
+    if (il==0){ ds4_ref_dump("q",0,q,(int)q_dim); ds4_ref_dump("kv",0,kv,(int)DS4_N_HEAD_DIM); }
 
     layer_attention_one(heads, model, layer, q, kv);
     rope_tail_layer_inplace(heads, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_ROT, pos, il, true);
     layer_grouped_out_one(attn_out, model, layer, heads);
+    if (il==0) ds4_ref_dump("attn_out",0,attn_out,(int)DS4_N_EMBD);
     hc_post_one(after_attn_hc, attn_out, attn_residual, post, comb, DS4_N_EMBD, n_hc);
+    if (il==0) ds4_ref_dump("after_attn",0,after_attn_hc,(int)(n_hc*DS4_N_EMBD));
 
     layer_ffn_one(out_hc, model, layer, after_attn_hc, il, token,
                   NULL, 0.0f, false);
@@ -13982,9 +14181,11 @@ static void forward_first_token_cpu(
 
     embed_token_f16(model, weights, token, plain);
     hc_from_plain_embedding(cur, plain, DS4_N_EMBD, DS4_N_HC);
+    ds4_ref_dump("embed", -1, cur, (int)(DS4_N_HC * DS4_N_EMBD));
 
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         layer_forward_self_one(next, model, &weights->layer[il], cur, il, 0, token);
+        ds4_ref_dump("layer", (int)il, next, (int)(DS4_N_HC * DS4_N_EMBD));
         float *tmp = cur;
         cur = next;
         next = tmp;
@@ -14039,6 +14240,7 @@ static void output_logits_one(
     rms_norm_weight(norm, embd, tensor_data(model, weights->output_norm), DS4_N_EMBD, DS4_RMS_EPS);
 
     matvec_q8_0(logits, model, weights->output, norm);
+    ds4_ref_dump("logits", -1, logits, (int)DS4_N_VOCAB);
 
     free(norm);
     free(embd);
@@ -55058,9 +55260,26 @@ int ds4_engine_first_token_test(ds4_engine *e, const ds4_tokens *prompt) {
         return 0;
     }
 
+    /* Cross-validation override: DS4_TOK=<id> forwards that token id instead of the
+     * prompt's first token, which is always BOS after chat encoding. */
+    int first_token = prompt->v[0];
+    const char *tok_env = getenv("DS4_TOK");
+    if (tok_env && tok_env[0]) {
+        char *end = NULL;
+        long v = strtol(tok_env, &end, 10);
+        if (!end || *end != '\0' || v < 0 || (uint64_t)v >= (uint64_t)DS4_N_VOCAB) {
+            fprintf(stderr, "ds4: DS4_TOK must be a token id in [0,%u)\n",
+                    (unsigned)DS4_N_VOCAB);
+            return 1;
+        }
+        first_token = (int)v;
+        fprintf(stderr, "ds4: DS4_TOK override: first-token test forwards token %d\n",
+                first_token);
+    }
+
     float *hc = xmalloc((size_t)DS4_N_HC * DS4_N_EMBD * sizeof(hc[0]));
     float *logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(logits[0]));
-    forward_first_token_cpu(hc, model, weights, prompt->v[0]);
+    forward_first_token_cpu(hc, model, weights, first_token);
     print_vec_stats("first-token final_hc", hc, (uint64_t)DS4_N_HC * DS4_N_EMBD);
     output_logits_one(logits, model, weights, hc);
     print_vec_stats("first-token logits", logits, DS4_N_VOCAB);
@@ -55088,6 +55307,93 @@ int ds4_engine_first_token_test(ds4_engine *e, const ds4_tokens *prompt) {
 
     free(logits);
     free(hc);
+    return 0;
+}
+
+/* Teacher-forced multi-position CPU decode used as the flux-V4 correctness ruler.
+ * No sampler, no tokenizer, no chat template: a FIXED token id list is pushed
+ * through forward_token_raw_swa_cpu_decode_scratch at positions 0..N-1, so every
+ * position takes the identical decode code path and the DS4_DUMP hooks emit one
+ * file per (tag, pos, layer).  Override the ids with
+ *   DS4_DECODE_TOKENS=<comma separated ids>   (default 0,1897,40000,100000,129279,201,5,818)
+ * Pair with DS4_DUMP=1 DS4_DUMP_LAYER=<il> DS4_DUMP_DIR=<dir>. */
+int ds4_engine_decode_dump_test(ds4_engine *e, int ctx_size) {
+    static const int default_toks[] = { 0, 1897, 40000, 100000, 129279, 201, 5, 818 };
+
+    int *toks = NULL;
+    int n_toks = 0;
+    const char *env = getenv("DS4_DECODE_TOKENS");
+    if (env && env[0]) {
+        int cap = 1;
+        for (const char *s = env; *s; s++) if (*s == ',') cap++;
+        toks = xmalloc((size_t)cap * sizeof(toks[0]));
+        const char *s = env;
+        while (*s) {
+            while (*s == ' ' || *s == '\t' || *s == ',') s++;
+            if (!*s) break;
+            char *end = NULL;
+            long v = strtol(s, &end, 10);
+            if (end == s) {
+                fprintf(stderr, "ds4: DS4_DECODE_TOKENS must be a comma separated list of ids\n");
+                free(toks);
+                return 1;
+            }
+            if (v < 0 || (uint64_t)v >= (uint64_t)DS4_N_VOCAB) {
+                fprintf(stderr, "ds4: DS4_DECODE_TOKENS entry %ld is outside [0,%u)\n",
+                        v, (unsigned)DS4_N_VOCAB);
+                free(toks);
+                return 1;
+            }
+            toks[n_toks++] = (int)v;
+            s = end;
+        }
+        if (n_toks == 0) {
+            fprintf(stderr, "ds4: DS4_DECODE_TOKENS is empty\n");
+            free(toks);
+            return 1;
+        }
+    } else {
+        n_toks = (int)(sizeof(default_toks) / sizeof(default_toks[0]));
+        toks = xmalloc((size_t)n_toks * sizeof(toks[0]));
+        memcpy(toks, default_toks, sizeof(default_toks));
+    }
+
+    uint32_t ctx = (ctx_size > 0) ? (uint32_t)ctx_size : 512u;
+    if (ctx > 4096u) ctx = 4096u;              /* the harness never runs long; keep caches small */
+    if (ctx < (uint32_t)n_toks + 1u) ctx = (uint32_t)n_toks + 1u;
+
+    const ds4_model *model = &e->model;
+    const ds4_weights *weights = &e->weights;
+
+    ds4_kv_cache cache;
+    kv_cache_init(&cache, ctx, 0);
+    ds4_cpu_decode_scratch sc;
+    cpu_decode_scratch_init(&sc, ctx);
+    float *logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(logits[0]));
+
+    const int dl = ds4_dump_layer();
+    const uint32_t dli = (dl >= 0 && (uint32_t)dl < DS4_N_LAYER) ? (uint32_t)dl : 0u;
+    fprintf(stderr, "ds4: decode-dump test, %d teacher-forced positions, ctx=%u, dump layer %d\n",
+            n_toks, ctx, dl);
+
+    printf("teacher-forced CPU decode (argmax per position):\n");
+    for (int p = 0; p < n_toks; p++) {
+        forward_token_raw_swa_cpu_decode_scratch(logits, model, weights, &cache,
+                                                 toks[p], (uint32_t)p,
+                                                 NULL, 0.0f, 0.0f, &sc);
+        int best = 0;
+        for (uint32_t i = 1; i < DS4_N_VOCAB; i++) if (logits[i] > logits[best]) best = (int)i;
+        printf("  pos %3d  in=%6d  argmax=%6d  logit=%11.5f  n_raw[l%02u]=%u n_comp[l%02u]=%u\n",
+               p, toks[p], best, logits[best],
+               dli, cache.layer[dli].n_raw,
+               dli, cache.layer[dli].n_comp);
+        fflush(stdout);
+    }
+
+    free(logits);
+    cpu_decode_scratch_free(&sc);
+    kv_cache_free(&cache);
+    free(toks);
     return 0;
 }
 

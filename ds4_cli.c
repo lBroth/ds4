@@ -84,6 +84,7 @@ typedef struct {
     ds4_think_mode think_mode;
     bool head_test;
     bool first_token_test;
+    bool decode_dump_test;
     bool metal_graph_test;
     bool metal_graph_full_test;
     bool metal_graph_prompt_test;
@@ -1204,12 +1205,16 @@ static int run_generation(ds4_engine *engine, const cli_config *cfg) {
 
     const bool diagnostic = cfg->gen.dump_tokens ||
                             cfg->gen.head_test ||
-                            cfg->gen.first_token_test;
+                            cfg->gen.first_token_test ||
+                            cfg->gen.decode_dump_test;
     if (cfg->gen.head_test) {
         rc = ds4_engine_head_test(engine, &prompt);
     }
     if (rc == 0 && cfg->gen.first_token_test) {
         rc = ds4_engine_first_token_test(engine, &prompt);
+    }
+    if (rc == 0 && cfg->gen.decode_dump_test) {
+        rc = ds4_engine_decode_dump_test(engine, cfg->gen.ctx_size);
     }
     if (cfg->gen.dump_tokens) {
         ds4_engine_dump_tokens(engine, &prompt);
@@ -1983,6 +1988,8 @@ static cli_config parse_options(int argc, char **argv) {
             c.gen.head_test = true;
         } else if (!strcmp(arg, "--first-token-test")) {
             c.gen.first_token_test = true;
+        } else if (!strcmp(arg, "--decode-dump-test")) {
+            c.gen.decode_dump_test = true;
         } else if (!strcmp(arg, "--metal-graph-test")) {
             c.gen.metal_graph_test = true;
 #ifdef DS4_ROCM_BUILD
@@ -2056,6 +2063,7 @@ static cli_config parse_options(int argc, char **argv) {
 }
 
 int main(int argc, char **argv) {
+    if (getenv("DS4_QAT_SELFTEST")) { ds4_qat_selftest(); return 0; }
     cli_config cfg = parse_options(argc, argv);
     if (cfg.gen.dump_tokens) {
         if (cfg.gen.prompt == NULL) {
@@ -2191,6 +2199,9 @@ int main(int argc, char **argv) {
                                         cfg.gen.imatrix_max_tokens);
     } else if (cfg.gen.perplexity_file_path) {
         rc = run_perplexity_file(engine, &cfg);
+    } else if (cfg.gen.decode_dump_test && cfg.gen.prompt == NULL) {
+        /* Teacher-forced decode dumps need no prompt: the ids come from DS4_DECODE_TOKENS. */
+        rc = ds4_engine_decode_dump_test(engine, cfg.gen.ctx_size);
     } else if (cfg.gen.prompt == NULL) {
         rc = run_repl(engine, &cfg);
     } else {
